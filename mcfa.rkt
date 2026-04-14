@@ -557,7 +557,7 @@
       (display ": ")
       (pretty-print (query-taint sink final-τ)))))
 
-(define (analyze* e [sinks '()])
+#;(define (analyze* e [sinks '()])
   (define h (run (interp e (hash) (list))))
   (define key `(interp ,e ,(hash) ,(list) ,(hash)))
   (if (verbose-mode) (print h) (display ""))
@@ -588,7 +588,3 @@
 
 (analyze filename sinks)
 
-#;(define pr '(program ((let ((x 42))) (update ++ x) (let ((y x))))))
-#;(define pr '(program ((let ((x 42))) (assgn x (bin + x 1)) (let ((y x))))))
-
-#;(analyze* pr)

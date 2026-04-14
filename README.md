@@ -1,9 +1,9 @@
-# JavaScript m-CFA
+# JavaScript m-CFA (Taint Analysis)
 
 Make sure npm is installed.
 
 Run by
 
 ```
-./run.sh [filename] [m]
+acorn --ecma2025 <program> > /tmp/ast.json && racket mcfa.rkt /tmp/ast.json 0 <sinks...>
 ```
