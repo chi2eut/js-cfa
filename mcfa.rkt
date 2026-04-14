@@ -9,15 +9,15 @@
 ;---------------------------------------------------------------------------------------------------------
 ; Fixpoint Monad Stuff
 
-(define ((unit . xs) σ eκ κ) (κ xs σ eκ))
-(define ((>>= c f) σ eκ κ) (c σ eκ (λ (xs σ eκ) ((apply f xs) σ eκ κ))))
+(define ((unit . xs) σ κ) ((car κ) xs σ))
+(define ((>>= c f) σ κ) (c σ (cons (λ (xs σ) ((apply f xs) σ κ)) (cdr κ))))
 (define (>> m . ms) (foldl (λ (m M) (>>= M (λ _ m))) m ms))
 
 (define ((∘ f g) s) (f (g s)))
 (define (id s) s)
 
-(define ((each . cs) σ eκ κ) (foldl (λ (c s→s) (∘ s→s (c σ eκ κ))) id cs))
-(define (fail σ eκ κ) (eκ (list bot) σ))
+(define ((each . cs) σ κ) (foldl (λ (c s→s) (∘ s→s (c σ κ))) id cs))
+(define (fail σ κ) ((cdr κ) (list bot) σ))
 
 (define (choose xs)
   (if (set-empty? xs)
@@ -35,31 +35,34 @@
      (>> (f x)
          (for-eachm f xs))]))
 
-(define (((cache k c) σ eκ κ) s)
+(define (((cache k c) σ κ) s)
+  (define key (append k (list σ)))
   (cond
-    [(hash-ref s k #f)
+    [(hash-ref s key #f)
      => (match-lambda
-          [(cons xss×σs×eκs κs)
-           (for/fold ([s (hash-set s k (cons xss×σs×eκs (cons κ κs)))])
-                     ([(list xs σ eκ) (in-set xss×σs×eκs)])
-             ((κ xs σ eκ) s))])]
+          [(cons xss×σs κs)
+           (for/fold ([s (hash-set s key (cons xss×σs (cons κ κs)))])
+                     ([xs×σ (in-set xss×σs)])
+             (match-let ([(list xs σ) xs×σ])
+               (((car κ) xs σ) s)))])]
     [else
-     ((c σ eκ
-       (λ (xs σ eκ)
-         (λ (s)
-           (match-let
-               ([(cons xss×σs×eκs κs) (hash-ref s k)])
-             (if (set-member? xss×σs×eκs (list xs σ eκ))
-                 s
-                 (for/fold ([s (hash-set s k (cons (set-add xss×σs×eκs (list xs σ eκ)) κs))])
-                           ([κ (in-list κs)])
-                   ((κ xs σ eκ) s)))))))
-      (hash-set s k (cons (set) (list κ))))]))
+     ((c σ
+       (cons (λ (xs σ)
+               (λ (s)
+                 (match-let
+                     ([(cons xss×σs κs) (hash-ref s key)])
+                   (if (set-member? xss×σs (list xs σ))
+                       s
+                       (for/fold ([s (hash-set s key (cons (set-add xss×σs (list xs σ)) κs))])
+                                 ([κ (in-list κs)])
+                         (((car κ) xs σ) s))))))
+             (cdr κ)))
+       (hash-set s key (cons (set) (list κ))))]))
 
 (define ((memo tag f) . xs)
   (cache (cons tag xs) (apply f xs)))
 (define (run c)
-  ((c (hash) (λ (xs σ) id) (λ (xs σ eκ) id)) (hash)))
+  ((c (hash) (cons (λ (xs σ) id) (λ (xs σ) id))) (hash)))
 
 ;----------------------------------------------------------------------------------------------------------
 ; Utility - store, env, etc.
@@ -117,20 +120,23 @@
     [(v₀ '⊥) v₀]
     [(v₀ v₁) '⊤]))
 
-(define ((sto-lookup a) σ eκ κ)
-  ((unit (car (hash-ref σ a)))
-   σ eκ κ))
+(define ((sto-lookup a) σ κ)
+  (define v (car (hash-ref σ a)))
+  (define labels (τ-lookup a σ))
+  ((unit (wrap-taint v labels)) σ κ))
 
-(define ((sto-extend a v) σ eκ κ)
-  ((unit (void))
-   (hash-update σ a
-                (λ (vs)
-                  (match* (v vs)
-                    [('undefined _) `(undefined ,0)]
-                    [((? val? v) `(undefined 0)) `(,v 1)]
-                    [((? val? v) `(,v₁ ,c)) `(,(⊔ v v₁) ,(incr c))]))
-                `(,bot ,0))
-   eκ κ))
+(define ((sto-extend a tv) σ κ)
+  (define v (strip-taint tv))
+  (define labels (get-labels tv))
+  (define σ′
+    (hash-update σ a
+                 (λ (vs)
+                   (match* (v vs)
+                     [('undefined _) `(undefined ,0)]
+                     [((? val? v) `(undefined 0)) `(,v 1)]
+                     [((? val? v) `(,v₁ ,c)) `(,(⊔ v v₁) ,(incr c))]))
+                 `(,bot ,0)))
+  ((unit (void)) (τ-extend a labels σ′) κ))
 
 (define incr
   (match-lambda
@@ -143,15 +149,38 @@
 (define (env-extend ρ x a)
   (hash-set ρ x a))
 
-(define ((error/exception . xs) σ eκ κ)
-  (eκ xs σ))
+;; TaintStore helpers - τ is stored inside σ under a reserved key
+(define τ-key '__taint__)
 
-(define ((inj-exception c f) σ eκ κ)
+(define (τ-lookup a σ)
+  (hash-ref (hash-ref σ τ-key (hash)) a (set)))
+
+(define (τ-extend a labels σ)
+  (if (set-empty? labels)
+      σ
+      (let ([cur-τ (hash-ref σ τ-key (hash))])
+        (hash-set σ τ-key
+                  (hash-update cur-τ a (λ (s) (set-union s labels)) (set))))))
+
+;; In-flight taint wrappers (transient - never stored in value lattice)
+(define (strip-taint tv)
+  (match tv [`(tainted ,v ,_) v] [_ tv]))
+
+(define (get-labels tv)
+  (match tv [`(tainted ,_ ,ls) ls] [_ (set)]))
+
+(define (wrap-taint v ls)
+  (if (set-empty? ls) v `(tainted ,v ,ls)))
+
+(define ((error/exception . xs) σ κ)
+  ((cdr κ) xs σ))
+
+(define ((inj-exception c f) σ κ)
   (c σ
-     (λ (xs σ)
-       ((apply f xs)
-        σ eκ κ))
-     κ))
+     (cons (car κ)
+           (λ (xs σ)
+             ((apply f xs)
+              σ κ)))))
 
 (define (proj v ty)
   (match v
@@ -165,7 +194,16 @@
        ['OBJ (choose obj)])]))
 
 (define (proj/ev m ty f)
-  (>>= m (λ (v) (>>= (proj v ty) f))))
+  (>>= m
+       (λ (tv)
+         (define labels (get-labels tv))
+         (define v (strip-taint tv))
+         (>>= (proj v ty)
+              (λ (component)
+                (>>= (f component)
+                     (λ (result)
+                       (unit (wrap-taint (strip-taint result)
+                                         (set-union labels (get-labels result)))))))))))
 
 (define (alloc x t) (list x t))
 
@@ -243,6 +281,7 @@
 (define interp
   (memo `interp
         (λ (e ρ t)
+          (pretty-print e)
           (match e
             [`(program ,es)
              (interp/top es ρ t)]
@@ -256,7 +295,7 @@
              (>>= (interp e ρ t)
                   (λ (v)
                     (>>= (match x
-                           [`(? symbol? x)
+                           [(? symbol? x)
                             (unit (env-lookup ρ x))]
                            [`(memberE ,obj ,property)
                             (eval/member x ρ t #t)])
@@ -272,11 +311,24 @@
                         (proj/ev (interp rhs ρ t) 'NUM
                                  (λ (rv) ((lattice-op op) lv rv)))))]
             [`(unary ,op ,e)
-             (proj/ev (interp e ρ t) (unop->argtp op)
-                      (λ (v) ((lattice-unop op) v)))]
+             (if (equal? 'delete)
+                 ....
+                 (proj/ev (interp e ρ t) (unop->argtp op)
+                          (λ (v) ((lattice-unop op) v))))]
+            [`(logical ,op ,lhs ,rhs)
+             (proj/ev (interp lhs ρ t) 'BOOL
+                      (λ (b1)
+                        (proj/ev (interp rhs ρ t) 'BOOL
+                                 (λ (b2)
+                                   (unit (inj ((logic/op op) b1 b2)))))))]
             [`(return ,e)
              (>>= (interp e ρ t)
                   (λ (v) (unit `(returnV ,v))))]
+            [`(app taintSource (,label ,e-arg))
+             (>>= (interp e-arg ρ t)
+                  (λ (tv)
+                    (unit (wrap-taint (strip-taint tv)
+                                      (set-union (get-labels tv) (set label))))))]
             [(list* 'app f args)
              (proj/ev (interp f ρ t) 'CLO
                       (match-lambda
@@ -292,18 +344,31 @@
                                          (extend xs es (env-extend ρ′ x a)))))]
                              [(null null)
                               (unit ρ′)]))
-                         (>>= (extend params args ρ′)
+                         (>>= (extend params (car args) ρ′)
                               (λ (ρ′) (interp e ρ′ t′)))]))]
             [`(forlp ,init ,tst ,update ,bod)
-             ....]
+             (interp `(block (,init
+                              (whlp ,tst
+                                    ,(add-to-bod bod update))))
+                     ρ t)]
             [`(whlp ,tst ,bod)
-             ....]
+             (proj/ev (interp tst ρ t) 'BOOL
+                      (λ (b) (if b
+                                 (interp `(dowhlp ,bod ,tst) ρ t)
+                                 (unit (void)))))]
             [`(dowhlp ,bod ,tst)
-             ....]
-            [`(update ,op ,arg)
-             ....]
-            [`(constructor ,cls ,args)
-             ....]
+             (>>= (interp bod ρ t)
+                  (match-lambda
+                    [`(returnV ,v)
+                     (unit `(return ,v))]
+                    [_
+                     (proj/ev (interp tst ρ t) 'BOOL
+                              (λ (b)
+                                (if b
+                                    (interp `(dowhlp ,bod ,tst) ρ t)
+                                    (unit (void)))))]))]
+            [`(update ,op ,(? symbol? x))
+             (interp `(assgn ,x (bin + ,x 1)) ρ t)]
             [`(arr ,elems)
              (define (itr es i)
                (match es
@@ -314,11 +379,10 @@
                   `((length : ,(length elems)))]))
              (interp `(obj ,(itr elems 0))
                      ρ t)]
-            [(list* 'obj properties)
+            [`(obj ,properties)
              (define (itr properties aggr)
                (match properties
                  [(list* `(,key : ,e) properties)
-                  (pretty-print key)
                   (>>= (interp e ρ t)
                        (λ (v)
                          (define a (obj-alloc key e t))
@@ -360,12 +424,17 @@
     [`(memberE ,obj ,property)
      (proj/ev (interp obj ρ t) 'OBJ
               (match-lambda
-                        [(list* 'obj props)
-                         (>>= (get-property property props)
-                              (λ (a)
-                                (if addr?
-                                    (unit a)
-                                    (sto-lookup a))))]))]))
+                [(list* 'obj props)
+                 (>>= (get-property property props)
+                      (λ (a)
+                        (if addr?
+                            (unit a)
+                            (sto-lookup a))))]))]))
+
+(define (add-to-bod bod e)
+  (match bod
+    [`(block ,es)
+     `(block ,(push-back es e))]))
 
 (define op->
   (match-lambda
@@ -380,6 +449,11 @@
 (define unop->
   (match-lambda
     ['! not]))
+
+(define logic/op
+  (match-lambda
+    ['&& (λ (x y) (and x y))]
+    ['|| (λ (x y) (or x y))]))
 
 (define unop->top
   (match-lambda
@@ -432,6 +506,28 @@
 
 
 ;----------------------------------------------------------------------------------------------------------
+; Taint queries
+
+(define (extract-final-τ h key)
+  (match (hash-ref h key #f)
+    [#f (hash)]
+    [(cons xss×σs _)
+     (for/fold ([τ-acc (hash)])
+               ([xs×σ (in-set xss×σs)])
+       (define σ-out (second xs×σ))
+       (define τ-out (hash-ref σ-out τ-key (hash)))
+       (for/fold ([acc τ-acc])
+                 ([(addr labels) (in-hash τ-out)])
+         (hash-update acc addr (λ (s) (set-union s labels)) (set))))]))
+
+(define (query-taint var-name τ)
+  (for/fold ([result (set)])
+            ([(addr labels) (in-hash τ)])
+    (if (and (list? addr) (not (null? addr)) (equal? (car addr) var-name))
+        (set-union result labels)
+        result)))
+
+;----------------------------------------------------------------------------------------------------------
 ; Running analysis
 
 (define (print h)
@@ -445,26 +541,54 @@
      (display "\n")]))
   (display "\n\n\n"))
 
-(define (analyze filename)
+(define (analyze filename [sinks '()])
   (define e (run-parse filename))
   (define h (run (interp e (hash) (list))))
-  (define key `(interp ,e ,(hash) ,(list)))
+  (define key `(interp ,e ,(hash) ,(list) ,(hash)))
   (if (verbose-mode) (print h) (display ""))
   (display "Query Result:\n")
   (pretty-print key)
-  (pretty-print (hash-ref h key)))
+  (pretty-print (hash-ref h key))
+  (when (not (null? sinks))
+    (define final-τ (extract-final-τ h key))
+    (display "\nTaint Query Results:\n")
+    (for ([sink sinks])
+      (display sink)
+      (display ": ")
+      (pretty-print (query-taint sink final-τ)))))
+
+(define (analyze* e [sinks '()])
+  (define h (run (interp e (hash) (list))))
+  (define key `(interp ,e ,(hash) ,(list) ,(hash)))
+  (if (verbose-mode) (print h) (display ""))
+  (display "Query Result:\n")
+  (pretty-print key)
+  (pretty-print (hash-ref h key))
+  (when (not (null? sinks))
+    (define final-τ (extract-final-τ h key))
+    (display "\nTaint Query Results:\n")
+    (for ([sink sinks])
+      (display sink)
+      (display ": ")
+      (pretty-print (query-taint sink final-τ)))))
 
 (require racket/cmdline)
 
-(define filename
+(define-values (filename sinks)
   (command-line
+   #:program "compiler"
    #:once-each
    [("-v" "--verbose") "Compile with verbose messages"
                        (verbose-mode #t)]
    [("-s" "--show") "Compile with profiling"
-                       (show-sto #t)]
-   #:args (filename m)
+                    (show-sto #t)]
+   #:args (filename m . rest)
    (current-m (string->number m))
-   filename))
+   (values filename (map string->symbol rest))))
 
-(analyze filename)
+(analyze filename sinks)
+
+#;(define pr '(program ((let ((x 42))) (update ++ x) (let ((y x))))))
+#;(define pr '(program ((let ((x 42))) (assgn x (bin + x 1)) (let ((y x))))))
+
+#;(analyze* pr)
